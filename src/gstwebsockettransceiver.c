@@ -5,7 +5,7 @@
 GST_DEBUG_CATEGORY_STATIC(gst_websocket_transceiver_debug);
 #define GST_CAT_DEFAULT gst_websocket_transceiver_debug
 
-/* Properties */
+/* Plugin properties */
 enum
 {
   PROP_0,
@@ -17,7 +17,6 @@ enum
   PROP_INITIAL_BUFFER_COUNT,
 };
 
-/* Default values */
 #define DEFAULT_URI NULL
 #define DEFAULT_SAMPLE_RATE 16000
 #define DEFAULT_CHANNELS 1
@@ -25,7 +24,7 @@ enum
 #define DEFAULT_MAX_QUEUE_SIZE 100
 #define DEFAULT_INITIAL_BUFFER_COUNT 3  /* Wait for 3 buffers before starting playback */
 
-/* Pad templates - accept any audio format (codec agnostic) */
+/* Sink pad template, accepts PCM, PCMU and PCMA */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
     GST_PAD_SINK,
     GST_PAD_ALWAYS,
@@ -41,6 +40,7 @@ static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
         "rate = (int) [ 8000, 48000 ], "
         "channels = (int) [ 1, 2 ]"));
 
+/* SRC pad template, accepts PCM, PCMU and PCMA */
 static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
@@ -59,7 +59,6 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE("src",
 #define gst_websocket_transceiver_parent_class parent_class
 G_DEFINE_TYPE(GstWebSocketTransceiver, gst_websocket_transceiver, GST_TYPE_ELEMENT);
 
-/* Forward declarations */
 static void gst_websocket_transceiver_finalize(GObject *object);
 static void gst_websocket_transceiver_set_property(GObject *object, guint prop_id,
     const GValue *value, GParamSpec *pspec);
@@ -78,7 +77,7 @@ static gboolean gst_websocket_transceiver_sink_setcaps(GstWebSocketTransceiver *
 static gpointer gst_websocket_transceiver_output_thread(gpointer user_data);
 static gpointer gst_websocket_transceiver_ws_thread(gpointer user_data);
 
-/* Class initialization */
+/* Plugin class initialization - set metadata and define properties */
 static void
 gst_websocket_transceiver_class_init(GstWebSocketTransceiverClass *klass)
 {
@@ -136,7 +135,7 @@ gst_websocket_transceiver_class_init(GstWebSocketTransceiverClass *klass)
       0, "WebSocket Audio Transceiver");
 }
 
-/* Instance initialization */
+/* Plugin initialization */
 static void
 gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
 {
@@ -159,16 +158,16 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   self->initial_buffer_count = DEFAULT_INITIAL_BUFFER_COUNT;
 
   /* Calculate audio parameters - will be set by caps negotiation */
-  self->bytes_per_sample = 0;  /* Will be set during caps negotiation */
-  self->frame_size_bytes = 0;   /* Will be calculated after caps negotiation */
+  self->bytes_per_sample = 0;  
+  self->frame_size_bytes = 0; 
   self->frame_duration = self->frame_duration_ms * GST_MSECOND;
 
   /* Initialize timing */
   self->base_timestamp = GST_CLOCK_TIME_NONE;
-  self->next_timestamp = 0;
+  self->next_timestamp = 0; /* for buffer timestamp controk */
   self->first_timestamp_set = FALSE;
 
-  /* Initialize queue */
+  /* Initialize queue - decouple websocket operations from src pad */
   self->recv_queue = g_queue_new();
   g_mutex_init(&self->queue_lock);
 
@@ -177,12 +176,11 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   g_cond_init(&self->output_cond);
   self->output_thread_running = FALSE;
 
-  /* Initialize state */
   self->connected = FALSE;
   self->eos_sent = FALSE;
   g_mutex_init(&self->state_lock);
 
-  /* WebSocket */
+  /* WebSocket  stuff */
   self->session = NULL;
   self->ws_conn = NULL;
   self->context = NULL;
@@ -190,11 +188,10 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   self->ws_thread = NULL;
   self->output_thread = NULL;
 
-  /* Mark as live source - produces data in real-time */
+  /* IMPORTANT - Mark as live source - produces data in real-time (analogous to is-live=true) */
   GST_OBJECT_FLAG_SET(self, GST_ELEMENT_FLAG_SOURCE);
 }
 
-/* Finalization */
 static void
 gst_websocket_transceiver_finalize(GObject *object)
 {
@@ -215,7 +212,7 @@ gst_websocket_transceiver_finalize(GObject *object)
   G_OBJECT_CLASS(parent_class)->finalize(object);
 }
 
-/* Property setters/getters */
+/* Property getters and setters (for inline pipeline string) */
 static void
 gst_websocket_transceiver_set_property(GObject *object, guint prop_id,
     const GValue *value, GParamSpec *pspec)
@@ -379,7 +376,7 @@ gst_websocket_transceiver_sink_setcaps(GstWebSocketTransceiver *self, GstCaps *c
       self->bytes_per_sample, self->frame_size_bytes,
       (float)self->frame_duration_ms);
 
-  /* Set same caps on src pad - codec agnostic passthrough */
+  /* Set same caps on src pad */
   if (!gst_pad_set_caps(self->srcpad, caps)) {
     GST_ERROR_OBJECT(self, "Failed to set caps on src pad");
     return FALSE;
@@ -406,10 +403,8 @@ gst_websocket_transceiver_sink_event(GstPad *pad, GstObject *parent, GstEvent *e
     }
     case GST_EVENT_EOS:
     {
+      /* When EOS comeas from sink, we ignore. We only send EOS on src pad when the WebSocket connection closes. */
       GST_INFO_OBJECT(self, "Received EOS on sink pad (input stream ended) - ignoring, will send EOS when WebSocket closes");
-      /* For a bidirectional element, sink EOS is independent from src EOS.
-       * We only send EOS on src pad when the WebSocket connection closes.
-       * Consume this event and don't propagate it. */
       gst_event_unref(event);
       ret = TRUE;
       break;
@@ -433,6 +428,7 @@ on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
   gsize size;
 
   if (type != SOUP_WEBSOCKET_DATA_BINARY) {
+    // TODO: support non-binary messages for pipeline controls (such as flush)
     GST_WARNING_OBJECT(self, "Received non-binary WebSocket message");
     return;
   }
@@ -604,7 +600,7 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
   gst_pad_push_event(self->srcpad, gst_event_new_stream_start(stream_id));
   g_free(stream_id);
 
-  /* These will be pushed once available */
+  /* Control pushing state */
   gboolean caps_pushed = FALSE;
   gboolean segment_pushed = FALSE;
   gboolean timing_initialized = FALSE;
@@ -625,6 +621,7 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
         self->base_timestamp = gst_clock_get_time(clock);
         self->next_timestamp = 0;
         self->first_timestamp_set = TRUE;
+        
         /* Start output time one frame duration in the future for smooth startup */
         next_output_time = self->base_timestamp + self->frame_duration;
         g_mutex_unlock(&self->output_lock);
@@ -638,7 +635,7 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       }
     }
 
-    /* Wait for initial buffering - accumulate some audio before starting playback */
+    /* Wait for initial buffering - accumulate some audio before starting playback to avoid clicks */
     if (initial_buffering && self->initial_buffer_count > 0) {
       g_mutex_lock(&self->queue_lock);
       guint queue_len = g_queue_get_length(self->recv_queue);
@@ -647,7 +644,7 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       if (queue_len < self->initial_buffer_count) {
         GST_DEBUG_OBJECT(self, "Initial buffering: %u/%u buffers",
             queue_len, self->initial_buffer_count);
-        g_usleep(50000);  /* 50ms */
+        g_usleep(50000);  /* if not enough, sleep. TODO: this should be aligned to the frame size */
         continue;
       } else {
         initial_buffering = FALSE;
