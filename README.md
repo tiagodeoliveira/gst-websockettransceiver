@@ -1,0 +1,101 @@
+# GStreamer WebSocket Transceiver Plugin
+
+GStreamer element that sends and receives audio over WebSocket connections. Bidirectional audio streaming for AI voice bots and real-time communication.
+
+## Requirements
+
+- GStreamer 1.0+
+- libsoup-3.0
+- Meson build system
+
+## Build
+
+```bash
+meson setup build
+meson compile -C build
+```
+
+## Install
+
+Add to GStreamer plugin path:
+
+```bash
+export GST_PLUGIN_PATH="/path/to/gst-websockettransceiver/build/src"
+```
+
+Verify installation:
+
+```bash
+gst-inspect-1.0 websockettransceiver
+```
+
+## Usage
+
+```bash
+gst-launch-1.0 \
+  audiotestsrc ! \
+  audio/x-raw,format=S16LE,rate=16000,channels=1 ! \
+  websockettransceiver uri=ws://localhost:8765 ! \
+  audioconvert ! \
+  autoaudiosink
+```
+
+## Properties
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `uri` | string | NULL | WebSocket URI to connect to (required) |
+| `sample-rate` | uint | 16000 | Audio sample rate in Hz |
+| `channels` | uint | 1 | Number of audio channels (1 or 2) |
+| `frame-duration-ms` | uint | 250 | Frame duration in milliseconds |
+| `max-queue-size` | uint | 100 | Maximum receive queue size in buffers |
+| `initial-buffer-count` | uint | 3 | Buffers to accumulate before playback (0 = no buffering) |
+
+## Supported Formats
+
+- **audio/x-raw**: S16LE, S16BE, S32LE, S32BE, F32LE, F32BE
+- **audio/x-mulaw**: G.711 μ-law
+- **audio/x-alaw**: G.711 A-law
+
+Sample rates: 8000-48000 Hz
+Channels: 1-2 (mono/stereo)
+
+## Examples
+
+### Send microphone to WebSocket, receive from WebSocket to speaker
+
+```bash
+gst-launch-1.0 \
+  autoaudiosrc ! \
+  audioconvert ! \
+  audio/x-mulaw,rate=8000,channels=1 ! \
+  websockettransceiver uri=ws://localhost:8765 ! \
+  audio/x-mulaw,rate=8000,channels=1 ! \
+  mulawdec ! \
+  audioconvert ! \
+  autoaudiosink
+```
+
+### RTP to WebSocket bridge
+
+```bash
+gst-launch-1.0 \
+  udpsrc port=5060 caps="application/x-rtp,media=audio,clock-rate=8000,encoding-name=PCMU" ! \
+  rtpjitterbuffer ! \
+  rtppcmudepay ! \
+  websockettransceiver uri=ws://localhost:8765 ! \
+  rtppcmupay ! \
+  udpsink host=127.0.0.1 port=5000
+```
+
+## Architecture
+
+The plugin is a bidirectional element with both sink and source pads:
+
+- **Sink pad**: Receives audio from upstream, sends over WebSocket
+- **Source pad**: Receives audio from WebSocket, pushes downstream
+
+Runs two threads:
+- WebSocket thread: Handles connection and message I/O
+- Output thread: Paced buffer delivery at configured frame rate
+
