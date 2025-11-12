@@ -595,12 +595,11 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
 
   GST_DEBUG_OBJECT(self, "Output thread started");
 
-  /* Send stream-start event */
+  // stream-start event
   gchar *stream_id = gst_pad_create_stream_id(self->srcpad, GST_ELEMENT(self), "websocket");
   gst_pad_push_event(self->srcpad, gst_event_new_stream_start(stream_id));
   g_free(stream_id);
 
-  /* Control pushing state */
   gboolean caps_pushed = FALSE;
   gboolean segment_pushed = FALSE;
   gboolean timing_initialized = FALSE;
@@ -613,29 +612,28 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     GstBuffer *buffer = NULL;
     GstFlowReturn ret;
 
-    /* Lazy initialization of clock, caps, and segment */
     if (!timing_initialized) {
       clock = gst_element_get_clock(GST_ELEMENT(self));
       if (clock) {
+        // if clock is available, initialize timert
         g_mutex_lock(&self->output_lock);
         self->base_timestamp = gst_clock_get_time(clock);
         self->next_timestamp = 0;
         self->first_timestamp_set = TRUE;
         
-        /* Start output time one frame duration in the future for smooth startup */
         next_output_time = self->base_timestamp + self->frame_duration;
         g_mutex_unlock(&self->output_lock);
         timing_initialized = TRUE;
         GST_DEBUG_OBJECT(self, "Timing initialized, base_timestamp: %" GST_TIME_FORMAT,
             GST_TIME_ARGS(self->base_timestamp));
       } else {
-        /* Clock not available yet, sleep and retry */
-        g_usleep(10000);  /* 10ms */
+        // clock might not be ready yet, awaits and try again
+        g_usleep(10000);
         continue;
       }
     }
 
-    /* Wait for initial buffering - accumulate some audio before starting playback to avoid clicks */
+    // Wait for initial buffering - accumulate some audio before starting playback to avoid clicks
     if (initial_buffering && self->initial_buffer_count > 0) {
       g_mutex_lock(&self->queue_lock);
       guint queue_len = g_queue_get_length(self->recv_queue);
@@ -644,7 +642,7 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       if (queue_len < self->initial_buffer_count) {
         GST_DEBUG_OBJECT(self, "Initial buffering: %u/%u buffers",
             queue_len, self->initial_buffer_count);
-        g_usleep(50000);  /* if not enough, sleep. TODO: this should be aligned to the frame size */
+        g_usleep(10000);  /* if not enough packets on the buffer, sleep */
         continue;
       } else {
         initial_buffering = FALSE;
@@ -671,13 +669,13 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       GST_DEBUG_OBJECT(self, "Segment event pushed");
     }
 
-    /* Skip this iteration if not fully initialized */
+    // Skip this iteration if not fully initialized
     if (!caps_pushed || !segment_pushed) {
       g_usleep(10000);  /* 10ms */
       continue;
     }
 
-    /* Check if EOS was sent (WebSocket closed) */
+    // Check if EOS was sent (WebSocket closed), if so, stop the thread
     g_mutex_lock(&self->state_lock);
     if (self->eos_sent) {
       g_mutex_unlock(&self->state_lock);
@@ -686,13 +684,13 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     }
     g_mutex_unlock(&self->state_lock);
 
-    /* Wait until next output time */
+    // Awaits until the next send cycle, this avoids overflowing the pipeline with data
     now = gst_clock_get_time(clock);
     if (now < next_output_time) {
       g_usleep((next_output_time - now) / 1000);
     }
 
-    /* Get data from queue */
+    // if everything checks, gets the buffer from the queue
     g_mutex_lock(&self->queue_lock);
     if (!g_queue_is_empty(self->recv_queue)) {
       buffer = g_queue_pop_head(self->recv_queue);
@@ -701,26 +699,27 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     }
     g_mutex_unlock(&self->queue_lock);
 
-    /* Check if connection closed and queue empty - time to send EOS */
+    // If not buffer was found 
     if (!buffer) {
       gboolean should_send_eos = FALSE;
 
+      // Check if disconnected and eos not sent
       g_mutex_lock(&self->state_lock);
       if (!self->connected && !self->eos_sent) {
-        /* Connection closed and no data in queue */
         self->eos_sent = TRUE;
         should_send_eos = TRUE;
       }
       g_mutex_unlock(&self->state_lock);
 
+      // if so, send eos and stop the thread
       if (should_send_eos) {
         GST_INFO_OBJECT(self, "Queue drained and WebSocket closed, sending EOS");
         gst_pad_push_event(self->srcpad, gst_event_new_eos());
         break;
       }
 
-      /* No data available, skip this cycle */
-      /* IMPORTANT: Still advance timestamps to maintain continuity */
+      // if still connect, simply skip this cycle
+      // IMPORTANT: Still advance timestamps to maintain continuity 
       GST_LOG_OBJECT(self, "No data available, skipping");
       g_mutex_lock(&self->output_lock);
       self->next_timestamp += self->frame_duration;
@@ -729,14 +728,14 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       continue;
     }
 
-    /* Set timestamp */
+    // stamp the buffer with pts and duration
     g_mutex_lock(&self->output_lock);
     GST_BUFFER_PTS(buffer) = self->base_timestamp + self->next_timestamp;
     GST_BUFFER_DURATION(buffer) = self->frame_duration;
     self->next_timestamp += self->frame_duration;
     g_mutex_unlock(&self->output_lock);
 
-    /* Push buffer */
+    // push buffer and check if it was pushed
     ret = gst_pad_push(self->srcpad, buffer);
     if (ret != GST_FLOW_OK) {
       GST_WARNING_OBJECT(self, "Error pushing buffer: %s", gst_flow_get_name(ret));
@@ -745,9 +744,11 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       }
     }
 
+    // recalculate when the next buffer should be send
     next_output_time += self->frame_duration;
   }
 
+  // when thread stop, release the clock
   gst_object_unref(clock);
   GST_DEBUG_OBJECT(self, "Output thread stopped");
   return NULL;
@@ -784,35 +785,37 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
   return GST_FLOW_OK;
 }
 
-/* State change handler */
+/*
+ * Pipeline state machine
+ * GStreamer pipeline goes NULL -> READY -> PAUSED -> PLAYING
+ */
 static GstStateChangeReturn
 gst_websocket_transceiver_change_state(GstElement *element, GstStateChange transition)
 {
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(element);
   GstStateChangeReturn ret;
 
+  // 1. before parent state changes
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
       if (!self->uri) {
-        GST_ERROR_OBJECT(self, "No URI set");
+        GST_ERROR_OBJECT(self, "No Websocket URI set");
         return GST_STATE_CHANGE_FAILURE;
       }
 
-      /* Start WebSocket thread */
+      // start websocket thread and await sleep to give time to connect
       self->ws_thread = g_thread_new("websocket-thread",
           gst_websocket_transceiver_ws_thread, self);
-
-      /* Wait a bit for connection */
-      g_usleep(500000);  /* 500ms */
+      g_usleep(500000);  // TODO: this should be smarter
       break;
 
     case GST_STATE_CHANGE_READY_TO_PAUSED:
-      /* Reset EOS flag for new stream */
+
+      // new stream is starting, get things ready
       g_mutex_lock(&self->state_lock);
       self->eos_sent = FALSE;
       g_mutex_unlock(&self->state_lock);
 
-      /* Start output thread */
       self->output_thread_running = TRUE;
       self->output_thread = g_thread_new("output-thread",
           gst_websocket_transceiver_output_thread, self);
@@ -822,31 +825,32 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
       break;
   }
 
+  // propagate state changes to parent
   ret = GST_ELEMENT_CLASS(parent_class)->change_state(element, transition);
   if (ret == GST_STATE_CHANGE_FAILURE)
     return ret;
 
+  // 2. after the parent state changed
   switch (transition) {
     case GST_STATE_CHANGE_READY_TO_PAUSED:
-      /* Live source - no preroll needed */
+      // this is a live stream, no pre-roll
       ret = GST_STATE_CHANGE_NO_PREROLL;
       break;
 
     case GST_STATE_CHANGE_PAUSED_TO_READY:
-      /* Stop output thread */
+      // pipeline moves back, from paused to ready, we prepare for a clean restart
       self->output_thread_running = FALSE;
       if (self->output_thread) {
         g_thread_join(self->output_thread);
         self->output_thread = NULL;
       }
 
-      /* Reset timing */
       self->first_timestamp_set = FALSE;
       self->next_timestamp = 0;
       break;
 
     case GST_STATE_CHANGE_READY_TO_NULL:
-      /* Stop WebSocket thread */
+      // one step back, so we prepare for shutdown
       if (self->loop) {
         g_main_loop_quit(self->loop);
       }
@@ -855,7 +859,6 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
         self->ws_thread = NULL;
       }
 
-      /* Clear queue */
       g_mutex_lock(&self->queue_lock);
       g_queue_free_full(self->recv_queue, (GDestroyNotify)gst_buffer_unref);
       self->recv_queue = g_queue_new();
@@ -863,7 +866,7 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
 
       g_mutex_lock(&self->state_lock);
       self->connected = FALSE;
-      self->eos_sent = FALSE;  /* Reset for next connection */
+      self->eos_sent = FALSE;
       g_mutex_unlock(&self->state_lock);
       break;
 
@@ -873,3 +876,4 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
 
   return ret;
 }
+

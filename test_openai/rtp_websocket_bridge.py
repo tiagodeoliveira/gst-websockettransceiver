@@ -6,16 +6,18 @@ Bridges RTP G.711 μ-law audio to/from WebSocket using the websockettransceiver 
 """
 
 import argparse
-import sys
 import logging
+import sys
+
 import gi
+from gi.repository import GLib, Gst
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib
+
 
 # Configuration
 DEFAULT_RTP_PORT = 5060
-DEFAULT_CLIENT_RTP_PORT = 5000
+DEFAULT_CLIENT_RTP_PORT = 10000
 DEFAULT_WS_URI = "ws://localhost:8765"
 AUDIO_RATE = 8000
 AUDIO_CHANNELS = 1
@@ -89,13 +91,9 @@ class RTPWebSocketBridge:
         """Create the GStreamer pipeline."""
         pipeline_desc = f"""
             udpsrc port={self.rtp_port} caps="application/x-rtp,media=audio,clock-rate=8000,encoding-name=PCMU,payload=0"
-            ! rtpjitterbuffer latency=100
             ! rtppcmudepay
-            ! audio/x-mulaw,rate={AUDIO_RATE},channels={AUDIO_CHANNELS}
-            ! websockettransceiver name=ws uri={self.ws_uri} max-queue-size=1000 initial-buffer-count=5
-            ! audio/x-mulaw,rate={AUDIO_RATE},channels={AUDIO_CHANNELS}
-            ! rtppcmupay pt=0 ssrc=12345 min-ptime=20000000 max-ptime=20000000
-            ! queue max-size-buffers=50 max-size-time=0 max-size-bytes=0
+            ! websockettransceiver name=ws uri={self.ws_uri} max-queue-size=50 initial-buffer-count=3 frame-duration-ms=20
+            ! rtppcmupay min-ptime=20000000 max-ptime=20000000
             ! udpsink host={self.client_ip} port={self.client_rtp_port} sync=false
         """
 

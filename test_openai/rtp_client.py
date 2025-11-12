@@ -5,20 +5,23 @@ RTP audio test client - sends/receives G.711 μ-law audio via RTP.
 
 import socket
 import pyaudio
-import audioop
 import time
 import threading
 import argparse
 import random
 from rtp import RTP, PayloadType
 
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop
+
 # Audio config
 RATE = 8000
 CHUNK = 160  # 20ms at 8kHz
 RTP_PAYLOAD_TYPE = 0  # PCMU
 
-# Defaults (matches standalone_pipeline.py)
-DEFAULT_LOCAL_PORT = 5000
+DEFAULT_LOCAL_PORT = 10000
 DEFAULT_REMOTE_IP = "127.0.0.1"
 DEFAULT_REMOTE_PORT = 5060
 
