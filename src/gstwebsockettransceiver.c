@@ -774,7 +774,6 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
 {
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(parent);
   GstMapInfo map;
-  GBytes *bytes;
   SoupWebsocketConnection *conn = NULL;
 
   /* Hold lock while checking and obtaining reference to connection */
@@ -790,7 +789,7 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
 
   /* Extract data and send over WebSocket */
   if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
-    bytes = g_bytes_new(map.data, map.size);
+    GBytes *bytes = g_bytes_new(map.data, map.size);
 
     GST_LOG_OBJECT(self, "Sending %zu bytes over WebSocket", map.size);
 

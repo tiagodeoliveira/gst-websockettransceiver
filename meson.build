@@ -16,3 +16,19 @@ plugins_install_dir = get_option('libdir') / 'gstreamer-1.0'
 
 subdir('src')
 subdir('tests')
+
+# Static analysis with cppcheck
+cppcheck = find_program('cppcheck', required: false)
+if cppcheck.found()
+  run_target('cppcheck',
+    command: [
+      cppcheck,
+      '--enable=warning,style,performance,portability',
+      '--error-exitcode=1',
+      '--suppress=missingIncludeSystem',
+      '--suppress=unknownMacro',
+      '--quiet',
+      meson.project_source_root() / 'src'
+    ]
+  )
+endif

@@ -111,6 +111,12 @@ meson test -C build -v
 ./tests/run_integration_test.sh ./build/tests/test_websockettransceiver_integration
 ```
 
+### Static analysis
+
+```bash
+meson compile -C build cppcheck
+```
+
 ## Docker
 
 Build and test without installing GStreamer locally:
