@@ -23,13 +23,17 @@ jobs:
           ninja-build \
           libgstreamer1.0-dev \
           libgstreamer-plugins-base1.0-dev \
-          libsoup-3.0-dev
+          libsoup-3.0-dev \
+          cppcheck
 
     - name: Configure
       run: meson setup build
 
     - name: Build
       run: meson compile -C build
+
+    - name: Static analysis
+      run: meson compile -C build cppcheck
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -45,13 +49,16 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install meson ninja gstreamer libsoup
+        brew install meson ninja gstreamer libsoup cppcheck
 
     - name: Configure
       run: meson setup build
 
     - name: Build
       run: meson compile -C build
+
+    - name: Static analysis
+      run: meson compile -C build cppcheck
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
