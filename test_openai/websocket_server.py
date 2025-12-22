@@ -39,12 +39,13 @@ class OpenAIRealtimeClient:
     """Manages connection to OpenAI Realtime API."""
 
     def __init__(
-        self, api_key: str, model: str, system_prompt: str, audio_callback, call_id: str
+        self, api_key: str, model: str, system_prompt: str, audio_callback, barge_in_callback, call_id: str
     ):
         self.api_key = api_key
         self.model = model
         self.system_prompt = system_prompt
         self.audio_callback = audio_callback
+        self.barge_in_callback = barge_in_callback
         self.call_id = call_id
 
         self.ws: Optional[WebSocketServerProtocol] = None
@@ -144,7 +145,9 @@ class OpenAIRealtimeClient:
             self.logger.info(f"Response created (id={response_id})")
 
         elif msg_type == "input_audio_buffer.speech_started":
-            self.logger.info("User speech started")
+            self.logger.info("User speech started - triggering barge-in")
+            if self.barge_in_callback:
+                await self.barge_in_callback()
 
         elif msg_type == "input_audio_buffer.speech_stopped":
             self.logger.info("User speech stopped")
@@ -163,7 +166,7 @@ class OpenAIRealtimeClient:
                 self.logger.info(f"Output: {transcript}")
 
         else:
-            self.logger.debug(f"Unhandled message type: {msg_type}")
+            self.logger.info(f"Unhandled message type: {msg_type}")
 
     async def trigger_greeting(self):
         """Trigger OpenAI to generate a greeting response with specific instructions."""
@@ -242,6 +245,7 @@ class ClientHandler:
             model=openai_model,
             system_prompt=system_prompt,
             audio_callback=self._handle_openai_audio,
+            barge_in_callback=self._handle_barge_in,
             call_id=call_id,
         )
 
@@ -295,6 +299,14 @@ class ClientHandler:
             await self.websocket.send(audio_bytes)
         except Exception as e:
             self.logger.error(f"Error sending audio to client: {e}")
+
+    async def _handle_barge_in(self):
+        """Handle barge-in by sending clear command to GStreamer client."""
+        try:
+            self.logger.info("Sending barge-in clear command to GStreamer")
+            await self.websocket.send('{"type": "clear"}')
+        except Exception as e:
+            self.logger.error(f"Error sending barge-in command: {e}")
 
     async def cleanup(self):
         """Cleanup resources."""

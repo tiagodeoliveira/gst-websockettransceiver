@@ -419,6 +419,33 @@ gst_websocket_transceiver_sink_event(GstPad *pad, GstObject *parent, GstEvent *e
   return ret;
 }
 
+/* Flush the receive queue and reset timestamps (for barge-in/interruption) */
+static void
+gst_websocket_transceiver_flush_queue(GstWebSocketTransceiver *self)
+{
+  GST_INFO_OBJECT(self, "Flushing receive queue (barge-in)");
+
+  /* Clear receive queue */
+  g_mutex_lock(&self->queue_lock);
+  while (!g_queue_is_empty(self->recv_queue)) {
+    GstBuffer *buf = g_queue_pop_head(self->recv_queue);
+    gst_buffer_unref(buf);
+  }
+  g_mutex_unlock(&self->queue_lock);
+
+  /* Reset timestamps for fresh start */
+  g_mutex_lock(&self->output_lock);
+  self->next_timestamp = 0;
+  self->first_timestamp_set = FALSE;
+  g_mutex_unlock(&self->output_lock);
+
+  /* Send flush events downstream */
+  gst_pad_push_event(self->srcpad, gst_event_new_flush_start());
+  gst_pad_push_event(self->srcpad, gst_event_new_flush_stop(TRUE));
+
+  GST_DEBUG_OBJECT(self, "Queue flushed, timestamps reset");
+}
+
 /* WebSocket message received callback */
 static void
 on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
@@ -429,13 +456,25 @@ on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
   gconstpointer data;
   gsize size;
 
-  if (type != SOUP_WEBSOCKET_DATA_BINARY) {
-    // TODO: support non-binary messages for pipeline controls (such as flush)
-    GST_WARNING_OBJECT(self, "Received non-binary WebSocket message");
+  data = g_bytes_get_data(message, &size);
+
+  /* Handle text messages as control commands */
+  if (type == SOUP_WEBSOCKET_DATA_TEXT) {
+    GST_DEBUG_OBJECT(self, "Received text message: %.*s", (int)size, (const gchar *)data);
+
+    /* Check for clear command: {"type": "clear"} */
+    if (g_strstr_len(data, size, "\"type\"") && g_strstr_len(data, size, "\"clear\"")) {
+      gst_websocket_transceiver_flush_queue(self);
+    } else {
+      GST_WARNING_OBJECT(self, "Unknown control message: %.*s", (int)size, (const gchar *)data);
+    }
     return;
   }
 
-  data = g_bytes_get_data(message, &size);
+  if (type != SOUP_WEBSOCKET_DATA_BINARY) {
+    GST_WARNING_OBJECT(self, "Received unknown WebSocket message type: %d", type);
+    return;
+  }
 
   GST_DEBUG_OBJECT(self, "Received WebSocket message: %zu bytes", size);
 

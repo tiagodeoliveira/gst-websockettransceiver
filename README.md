@@ -60,6 +60,25 @@ gst-launch-1.0 \
 Sample rates: 8000-48000 Hz
 Channels: 1-2 (mono/stereo)
 
+## Control Messages
+
+The element supports JSON control messages via WebSocket text frames for pipeline control.
+
+### Clear/Barge-in
+
+To clear all pending audio buffers (useful for voice AI barge-in scenarios):
+
+```json
+{"type": "clear"}
+```
+
+When received, this command:
+- Clears all buffered audio in the receive queue
+- Resets timestamps for seamless continuation
+- Sends flush events downstream to clear the pipeline
+
+This enables immediate interruption of AI speech when the user starts talking.
+
 ## Examples
 
 ### Send microphone to WebSocket, receive from WebSocket to speaker
