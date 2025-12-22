@@ -10,9 +10,11 @@ import logging
 import sys
 
 import gi
-from gi.repository import GLib, Gst
 
 gi.require_version("Gst", "1.0")
+# ruff: noqa: E402
+from gi.repository import GLib, Gst
+
 
 
 # Configuration
