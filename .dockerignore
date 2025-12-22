@@ -1,0 +1,9 @@
+build/
+.git/
+*.o
+*.so
+*.dylib
+__pycache__/
+*.pyc
+.vscode/
+.idea/

@@ -15,3 +15,4 @@ soup_dep = dependency('libsoup-3.0', version: soup_req)
 plugins_install_dir = get_option('libdir') / 'gstreamer-1.0'
 
 subdir('src')
+subdir('tests')

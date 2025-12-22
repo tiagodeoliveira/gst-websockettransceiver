@@ -88,6 +88,47 @@ gst-launch-1.0 \
   udpsink host=127.0.0.1 port=5000
 ```
 
+## Testing
+
+### Run all tests
+
+```bash
+meson test -C build -v
+```
+
+### Test structure
+
+- **Unit tests** (`tests/check/elements/websockettransceiver.c`): Fast tests for element creation, properties, pads, and state changes. No network required.
+- **Integration tests** (`tests/check/elements/websockettransceiver_integration.c`): Tests with a real WebSocket server. Verifies connection, data sending, and multiple buffer handling.
+
+### Run specific test suite
+
+```bash
+# Unit tests only
+./build/tests/test_websockettransceiver
+
+# Integration tests only (starts stub WebSocket server automatically)
+./tests/run_integration_test.sh ./build/tests/test_websockettransceiver_integration
+```
+
+## Docker
+
+Build and test without installing GStreamer locally:
+
+```bash
+# Build the image
+docker build -t gst-websockettransceiver .
+
+# Run all tests
+docker run --rm gst-websockettransceiver
+
+# Interactive shell for debugging
+docker run --rm -it gst-websockettransceiver bash
+
+# Run specific commands
+docker run --rm gst-websockettransceiver meson test -C build --list
+```
+
 ## Architecture
 
 The plugin is a bidirectional element with both sink and source pads:

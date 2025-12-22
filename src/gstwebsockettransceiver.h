@@ -69,6 +69,7 @@ struct _GstWebSocketTransceiver
   gboolean connected;
   gboolean eos_sent;  /* Flag to prevent duplicate EOS events */
   GMutex state_lock;
+  GCond connect_cond;  /* Signaled when WebSocket connection is established */
 };
 
 struct _GstWebSocketTransceiverClass

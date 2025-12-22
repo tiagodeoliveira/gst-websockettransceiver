@@ -179,6 +179,7 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   self->connected = FALSE;
   self->eos_sent = FALSE;
   g_mutex_init(&self->state_lock);
+  g_cond_init(&self->connect_cond);
 
   /* WebSocket  stuff */
   self->session = NULL;
@@ -208,6 +209,7 @@ gst_websocket_transceiver_finalize(GObject *object)
   g_mutex_clear(&self->output_lock);
   g_cond_clear(&self->output_cond);
   g_mutex_clear(&self->state_lock);
+  g_cond_clear(&self->connect_cond);
 
   G_OBJECT_CLASS(parent_class)->finalize(object);
 }
@@ -494,8 +496,9 @@ on_websocket_connected(GObject *source, GAsyncResult *res, gpointer user_data)
 {
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(user_data);
   GError *error = NULL;
+  SoupWebsocketConnection *conn;
 
-  self->ws_conn = soup_session_websocket_connect_finish(
+  conn = soup_session_websocket_connect_finish(
       SOUP_SESSION(source), res, &error);
 
   if (error) {
@@ -504,24 +507,27 @@ on_websocket_connected(GObject *source, GAsyncResult *res, gpointer user_data)
     return;
   }
 
-  if (!self->ws_conn) {
+  if (!conn) {
     GST_ERROR_OBJECT(self, "WebSocket connection returned NULL without error");
     return;
   }
 
   GST_INFO_OBJECT(self, "WebSocket connected to %s", self->uri);
   GST_DEBUG_OBJECT(self, "Connection state: %d",
-      soup_websocket_connection_get_state(self->ws_conn));
+      soup_websocket_connection_get_state(conn));
 
-  g_signal_connect(self->ws_conn, "message",
+  g_signal_connect(conn, "message",
       G_CALLBACK(on_websocket_message), self);
-  g_signal_connect(self->ws_conn, "error",
+  g_signal_connect(conn, "error",
       G_CALLBACK(on_websocket_error), self);
-  g_signal_connect(self->ws_conn, "closed",
+  g_signal_connect(conn, "closed",
       G_CALLBACK(on_websocket_closed), self);
 
+  /* Set ws_conn and connected atomically under lock, then signal waiters */
   g_mutex_lock(&self->state_lock);
+  self->ws_conn = conn;
   self->connected = TRUE;
+  g_cond_signal(&self->connect_cond);
   g_mutex_unlock(&self->state_lock);
 }
 
@@ -556,18 +562,24 @@ gst_websocket_transceiver_ws_thread(gpointer user_data)
   /* Run event loop */
   g_main_loop_run(self->loop);
 
-  /* Cleanup */
+  /* Cleanup - hold lock while clearing ws_conn to prevent race with chain function */
+  g_mutex_lock(&self->state_lock);
   if (self->ws_conn) {
-    SoupWebsocketState state = soup_websocket_connection_get_state(self->ws_conn);
+    SoupWebsocketConnection *conn = self->ws_conn;
+    self->ws_conn = NULL;
+    self->connected = FALSE;
+    g_mutex_unlock(&self->state_lock);
+
+    SoupWebsocketState state = soup_websocket_connection_get_state(conn);
     if (state == SOUP_WEBSOCKET_STATE_OPEN) {
       GST_DEBUG_OBJECT(self, "Closing WebSocket connection");
-      soup_websocket_connection_close(self->ws_conn,
-          SOUP_WEBSOCKET_CLOSE_NORMAL, NULL);
+      soup_websocket_connection_close(conn, SOUP_WEBSOCKET_CLOSE_NORMAL, NULL);
     } else {
       GST_DEBUG_OBJECT(self, "WebSocket already closed (state: %d)", state);
     }
-    g_object_unref(self->ws_conn);
-    self->ws_conn = NULL;
+    g_object_unref(conn);
+  } else {
+    g_mutex_unlock(&self->state_lock);
   }
 
   g_object_unref(self->session);
@@ -748,8 +760,10 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     next_output_time += self->frame_duration;
   }
 
-  // when thread stop, release the clock
-  gst_object_unref(clock);
+  // when thread stop, release the clock if we obtained one
+  if (clock) {
+    gst_object_unref(clock);
+  }
   GST_DEBUG_OBJECT(self, "Output thread stopped");
   return NULL;
 }
@@ -761,12 +775,18 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(parent);
   GstMapInfo map;
   GBytes *bytes;
+  SoupWebsocketConnection *conn = NULL;
 
+  /* Hold lock while checking and obtaining reference to connection */
+  g_mutex_lock(&self->state_lock);
   if (!self->connected || !self->ws_conn) {
+    g_mutex_unlock(&self->state_lock);
     GST_WARNING_OBJECT(self, "WebSocket not connected, dropping buffer");
     gst_buffer_unref(buffer);
     return GST_FLOW_OK;
   }
+  conn = g_object_ref(self->ws_conn);
+  g_mutex_unlock(&self->state_lock);
 
   /* Extract data and send over WebSocket */
   if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
@@ -774,13 +794,14 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
 
     GST_LOG_OBJECT(self, "Sending %zu bytes over WebSocket", map.size);
 
-    soup_websocket_connection_send_binary(self->ws_conn,
+    soup_websocket_connection_send_binary(conn,
         g_bytes_get_data(bytes, NULL), g_bytes_get_size(bytes));
 
     g_bytes_unref(bytes);
     gst_buffer_unmap(buffer, &map);
   }
 
+  g_object_unref(conn);
   gst_buffer_unref(buffer);
   return GST_FLOW_OK;
 }
@@ -803,10 +824,27 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
         return GST_STATE_CHANGE_FAILURE;
       }
 
-      // start websocket thread and await sleep to give time to connect
+      /* Start websocket thread and wait for connection with timeout */
       self->ws_thread = g_thread_new("websocket-thread",
           gst_websocket_transceiver_ws_thread, self);
-      g_usleep(500000);  // TODO: this should be smarter
+
+      /* Wait up to 5 seconds for connection to establish */
+      {
+        gint64 end_time = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
+        g_mutex_lock(&self->state_lock);
+        while (!self->connected) {
+          if (!g_cond_wait_until(&self->connect_cond, &self->state_lock, end_time)) {
+            /* Timeout - connection not established */
+            g_mutex_unlock(&self->state_lock);
+            GST_WARNING_OBJECT(self, "WebSocket connection timeout, continuing anyway");
+            break;
+          }
+        }
+        if (self->connected) {
+          g_mutex_unlock(&self->state_lock);
+          GST_INFO_OBJECT(self, "WebSocket connection established");
+        }
+      }
       break;
 
     case GST_STATE_CHANGE_READY_TO_PAUSED:
