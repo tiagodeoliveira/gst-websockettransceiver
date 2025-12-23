@@ -5,12 +5,14 @@ project('gst-websockettransceiver', 'c',
 gst_req = '>= 1.20.0'
 glib_req = '>= 2.62'
 soup_req = '>= 3.0'
+json_req = '>= 1.6'
 
 gst_dep = dependency('gstreamer-1.0', version: gst_req)
 gst_base_dep = dependency('gstreamer-base-1.0', version: gst_req)
 gst_audio_dep = dependency('gstreamer-audio-1.0', version: gst_req)
 glib_dep = dependency('glib-2.0', version: glib_req)
 soup_dep = dependency('libsoup-3.0', version: soup_req)
+json_dep = dependency('json-glib-1.0', version: json_req)
 
 plugins_install_dir = get_option('libdir') / 'gstreamer-1.0'
 

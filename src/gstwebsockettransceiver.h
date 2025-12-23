@@ -26,50 +26,42 @@ struct _GstWebSocketTransceiver
 {
   GstElement parent;
 
-  /* Pads */
   GstPad *sinkpad;
   GstPad *srcpad;
 
-  /* Properties */
   gchar *uri;
   guint sample_rate;
   guint channels;
-  guint frame_duration_ms;  /* Frame duration in milliseconds */
-  guint max_queue_size;     /* Maximum receive queue size in buffers */
-  guint initial_buffer_count; /* Number of buffers to accumulate before starting playback */
+  guint frame_duration_ms;
+  guint max_queue_size;
+  guint initial_buffer_count;
 
-  /* WebSocket */
   SoupSession *session;
   SoupWebsocketConnection *ws_conn;
   GMainContext *context;
   GMainLoop *loop;
   GThread *ws_thread;
 
-  /* Audio parameters */
   guint bytes_per_sample;
-  guint frame_size_bytes; 
-  GstClockTime frame_duration; 
+  guint frame_size_bytes;
+  GstClockTime frame_duration;
 
-  /* Timing */
   GstClockTime base_timestamp;
   GstClockTime next_timestamp;
   gboolean first_timestamp_set;
 
-  /* Data queue for received audio */
   GQueue *recv_queue;
   GMutex queue_lock;
 
-  /* Output thread */
   GThread *output_thread;
   gboolean output_thread_running;
   GMutex output_lock;
   GCond output_cond;
 
-  /* State */
   gboolean connected;
-  gboolean eos_sent;  /* Flag to prevent duplicate EOS events */
+  gboolean eos_sent;
   GMutex state_lock;
-  GCond connect_cond;  /* Signaled when WebSocket connection is established */
+  GCond connect_cond;
 };
 
 struct _GstWebSocketTransceiverClass

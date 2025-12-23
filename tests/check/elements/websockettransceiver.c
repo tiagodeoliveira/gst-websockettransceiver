@@ -1,12 +1,5 @@
-/* GstCheck unit tests for websockettransceiver element
- *
- * These are fast-fail tests that verify basic element functionality
- * without requiring an actual WebSocket server.
- */
-
 #include <gst/check/gstcheck.h>
 
-/* Test that the element can be created */
 GST_START_TEST(test_element_create)
 {
   GstElement *element;
@@ -19,7 +12,6 @@ GST_START_TEST(test_element_create)
 }
 GST_END_TEST;
 
-/* Test that properties have correct default values */
 GST_START_TEST(test_properties_default)
 {
   GstElement *element;
@@ -38,7 +30,6 @@ GST_START_TEST(test_properties_default)
       "initial-buffer-count", &initial_buffer_count,
       NULL);
 
-  /* Check defaults match what's defined in the plugin */
   fail_unless(uri == NULL, "Default URI should be NULL");
   fail_unless_equals_int(sample_rate, 16000);
   fail_unless_equals_int(channels, 1);
@@ -51,7 +42,6 @@ GST_START_TEST(test_properties_default)
 }
 GST_END_TEST;
 
-/* Test that properties can be set and retrieved */
 GST_START_TEST(test_properties_set_get)
 {
   GstElement *element;
@@ -61,7 +51,6 @@ GST_START_TEST(test_properties_set_get)
   element = gst_element_factory_make("websockettransceiver", NULL);
   fail_unless(element != NULL);
 
-  /* Set properties */
   g_object_set(element,
       "uri", "wss://example.com/ws",
       "sample-rate", 48000,
@@ -69,7 +58,6 @@ GST_START_TEST(test_properties_set_get)
       "frame-duration-ms", 100,
       NULL);
 
-  /* Verify they were set correctly */
   g_object_get(element,
       "uri", &uri,
       "sample-rate", &sample_rate,
@@ -85,7 +73,6 @@ GST_START_TEST(test_properties_set_get)
 }
 GST_END_TEST;
 
-/* Test that element has expected pads */
 GST_START_TEST(test_pads_exist)
 {
   GstElement *element;
@@ -108,7 +95,6 @@ GST_START_TEST(test_pads_exist)
 }
 GST_END_TEST;
 
-/* Test sink pad caps */
 GST_START_TEST(test_sink_pad_caps)
 {
   GstElement *element;
@@ -125,7 +111,6 @@ GST_START_TEST(test_sink_pad_caps)
   fail_unless(template_caps != NULL, "Sink pad should have template caps");
   fail_unless(!gst_caps_is_empty(template_caps), "Template caps should not be empty");
 
-  /* Verify it accepts raw audio */
   caps = gst_caps_new_simple("audio/x-raw",
       "format", G_TYPE_STRING, "S16LE",
       "rate", G_TYPE_INT, 16000,
@@ -142,7 +127,6 @@ GST_START_TEST(test_sink_pad_caps)
 }
 GST_END_TEST;
 
-/* Test src pad caps */
 GST_START_TEST(test_src_pad_caps)
 {
   GstElement *element;
@@ -159,7 +143,6 @@ GST_START_TEST(test_src_pad_caps)
   fail_unless(template_caps != NULL, "Src pad should have template caps");
   fail_unless(!gst_caps_is_empty(template_caps), "Template caps should not be empty");
 
-  /* Verify it can output raw audio */
   caps = gst_caps_new_simple("audio/x-raw",
       "format", G_TYPE_STRING, "S16LE",
       "rate", G_TYPE_INT, 16000,
@@ -176,7 +159,6 @@ GST_START_TEST(test_src_pad_caps)
 }
 GST_END_TEST;
 
-/* Test state change NULL -> READY (should fail without URI) */
 GST_START_TEST(test_state_change_no_uri)
 {
   GstElement *element;
@@ -185,7 +167,6 @@ GST_START_TEST(test_state_change_no_uri)
   element = gst_element_factory_make("websockettransceiver", NULL);
   fail_unless(element != NULL);
 
-  /* Without URI set, state change to READY should fail */
   ret = gst_element_set_state(element, GST_STATE_READY);
   fail_unless(ret == GST_STATE_CHANGE_FAILURE,
       "State change to READY without URI should fail");
@@ -195,7 +176,6 @@ GST_START_TEST(test_state_change_no_uri)
 }
 GST_END_TEST;
 
-/* Test that element is marked as live source */
 GST_START_TEST(test_is_live_source)
 {
   GstElement *element;
@@ -210,7 +190,6 @@ GST_START_TEST(test_is_live_source)
   fail_unless(src_pad != NULL);
 
   query = gst_query_new_latency();
-  /* Note: Query may not work in NULL state, but we test the query exists */
   if (gst_pad_query(src_pad, query)) {
     gst_query_parse_latency(query, &live, NULL, NULL);
     fail_unless(live == TRUE, "Element should be a live source");
