@@ -171,6 +171,10 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   g_mutex_init(&self->state_lock);
   g_cond_init(&self->connect_cond);
 
+  g_cond_init(&self->queue_cond);
+  g_cond_init(&self->caps_cond);
+  self->caps_ready = FALSE;
+
   self->session = NULL;
   self->ws_conn = NULL;
   self->context = NULL;
@@ -198,6 +202,8 @@ gst_websocket_transceiver_finalize(GObject *object)
   g_cond_clear(&self->output_cond);
   g_mutex_clear(&self->state_lock);
   g_cond_clear(&self->connect_cond);
+  g_cond_clear(&self->queue_cond);
+  g_cond_clear(&self->caps_cond);
 
   G_OBJECT_CLASS(parent_class)->finalize(object);
 }
@@ -358,6 +364,11 @@ gst_websocket_transceiver_sink_setcaps(GstWebSocketTransceiver *self, GstCaps *c
     return FALSE;
   }
 
+  g_mutex_lock(&self->state_lock);
+  self->caps_ready = TRUE;
+  g_cond_signal(&self->caps_cond);
+  g_mutex_unlock(&self->state_lock);
+
   return TRUE;
 }
 
@@ -478,6 +489,7 @@ on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
   GST_DEBUG_OBJECT(self, "Queued buffer, queue length: %u",
       g_queue_get_length(self->recv_queue));
 
+  g_cond_signal(&self->queue_cond);
   g_mutex_unlock(&self->queue_lock);
 }
 
@@ -648,7 +660,10 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
         GST_DEBUG_OBJECT(self, "Timing initialized, base_timestamp: %" GST_TIME_FORMAT,
             GST_TIME_ARGS(self->base_timestamp));
       } else {
-        g_usleep(10000);
+        gint64 wait_until = g_get_monotonic_time() + 100 * G_TIME_SPAN_MILLISECOND;
+        g_mutex_lock(&self->output_lock);
+        g_cond_wait_until(&self->output_cond, &self->output_lock, wait_until);
+        g_mutex_unlock(&self->output_lock);
         continue;
       }
     }
@@ -657,27 +672,38 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     if (initial_buffering && self->initial_buffer_count > 0) {
       g_mutex_lock(&self->queue_lock);
       guint queue_len = g_queue_get_length(self->recv_queue);
-      g_mutex_unlock(&self->queue_lock);
 
       if (queue_len < self->initial_buffer_count) {
         GST_DEBUG_OBJECT(self, "Initial buffering: %u/%u buffers",
             queue_len, self->initial_buffer_count);
-        g_usleep(10000);
+        gint64 wait_until = g_get_monotonic_time() + 100 * G_TIME_SPAN_MILLISECOND;
+        g_cond_wait_until(&self->queue_cond, &self->queue_lock, wait_until);
+        g_mutex_unlock(&self->queue_lock);
         continue;
       } else {
         initial_buffering = FALSE;
         GST_INFO_OBJECT(self, "Initial buffering complete, starting playback with %u buffers",
             queue_len);
+        g_mutex_unlock(&self->queue_lock);
       }
     }
 
     if (!caps_pushed) {
+      g_mutex_lock(&self->state_lock);
+      if (!self->caps_ready && self->output_thread_running) {
+        gint64 wait_until = g_get_monotonic_time() + 100 * G_TIME_SPAN_MILLISECOND;
+        g_cond_wait_until(&self->caps_cond, &self->state_lock, wait_until);
+      }
+      g_mutex_unlock(&self->state_lock);
+
       GstCaps *caps = gst_pad_get_current_caps(self->srcpad);
       if (caps) {
         gst_pad_push_event(self->srcpad, gst_event_new_caps(caps));
         gst_caps_unref(caps);
         caps_pushed = TRUE;
         GST_DEBUG_OBJECT(self, "Caps event pushed");
+      } else {
+        continue;
       }
     }
 
@@ -687,11 +713,6 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       gst_pad_push_event(self->srcpad, gst_event_new_segment(&segment));
       segment_pushed = TRUE;
       GST_DEBUG_OBJECT(self, "Segment event pushed");
-    }
-
-    if (!caps_pushed || !segment_pushed) {
-      g_usleep(10000);
-      continue;
     }
 
     g_mutex_lock(&self->state_lock);
@@ -704,7 +725,14 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
 
     now = gst_clock_get_time(clock);
     if (now < next_output_time) {
-      g_usleep((next_output_time - now) / 1000);
+      gint64 wait_ns = next_output_time - now;
+      gint64 wait_until = g_get_monotonic_time() + (wait_ns / 1000);
+      g_mutex_lock(&self->output_lock);
+      g_cond_wait_until(&self->output_cond, &self->output_lock, wait_until);
+      g_mutex_unlock(&self->output_lock);
+      if (!self->output_thread_running) {
+        break;
+      }
     }
 
     g_mutex_lock(&self->queue_lock);
@@ -834,6 +862,7 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
     case GST_STATE_CHANGE_READY_TO_PAUSED:
       g_mutex_lock(&self->state_lock);
       self->eos_sent = FALSE;
+      self->caps_ready = FALSE;
       g_mutex_unlock(&self->state_lock);
 
       self->output_thread_running = TRUE;
@@ -856,6 +885,19 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
 
     case GST_STATE_CHANGE_PAUSED_TO_READY:
       self->output_thread_running = FALSE;
+
+      g_mutex_lock(&self->queue_lock);
+      g_cond_broadcast(&self->queue_cond);
+      g_mutex_unlock(&self->queue_lock);
+
+      g_mutex_lock(&self->state_lock);
+      g_cond_broadcast(&self->caps_cond);
+      g_mutex_unlock(&self->state_lock);
+
+      g_mutex_lock(&self->output_lock);
+      g_cond_broadcast(&self->output_cond);
+      g_mutex_unlock(&self->output_lock);
+
       if (self->output_thread) {
         g_thread_join(self->output_thread);
         self->output_thread = NULL;
@@ -863,6 +905,7 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
 
       self->first_timestamp_set = FALSE;
       self->next_timestamp = 0;
+      self->caps_ready = FALSE;
       break;
 
     case GST_STATE_CHANGE_READY_TO_NULL:

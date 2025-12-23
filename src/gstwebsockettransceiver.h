@@ -62,6 +62,10 @@ struct _GstWebSocketTransceiver
   gboolean eos_sent;
   GMutex state_lock;
   GCond connect_cond;
+
+  GCond queue_cond;
+  GCond caps_cond;
+  gboolean caps_ready;
 };
 
 struct _GstWebSocketTransceiverClass
