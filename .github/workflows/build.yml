@@ -24,6 +24,7 @@ jobs:
           libgstreamer1.0-dev \
           libgstreamer-plugins-base1.0-dev \
           libsoup-3.0-dev \
+          libjson-glib-dev \
           cppcheck
 
     - name: Configure
@@ -49,7 +50,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install meson ninja gstreamer libsoup cppcheck
+        brew install meson ninja gstreamer libsoup json-glib cppcheck
 
     - name: Configure
       run: meson setup build
