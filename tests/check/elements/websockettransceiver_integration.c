@@ -144,18 +144,36 @@ GST_START_TEST(test_send_multiple_buffers)
 }
 GST_END_TEST;
 
+static GstPadProbeReturn
+buffer_counter_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  gint *counter = (gint *) user_data;
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    g_atomic_int_inc(counter);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 GST_START_TEST(test_barge_in_clear)
 {
-  GstElement *element;
-  GstPad *sink_pad;
+  GstElement *pipeline, *element, *fakesink;
+  GstPad *sink_pad, *fs_sink_pad;
   GstBuffer *buffer;
   GstCaps *caps;
   GstSegment segment;
   GstFlowReturn flow_ret;
   gint i;
+  gint buffer_count = 0;
 
+  pipeline = gst_pipeline_new("test-pipeline");
   element = gst_element_factory_make("websockettransceiver", NULL);
+  fakesink = gst_element_factory_make("fakesink", NULL);
+  
   fail_unless(element != NULL);
+  fail_unless(fakesink != NULL);
+
+  gst_bin_add_many(GST_BIN(pipeline), element, fakesink, NULL);
+  fail_unless(gst_element_link(element, fakesink));
 
   g_object_set(element,
       "uri", TEST_WS_URI,
@@ -163,6 +181,12 @@ GST_START_TEST(test_barge_in_clear)
       "channels", 1,
       "frame-duration-ms", 20,
       NULL);
+  
+  g_object_set(fakesink, "sync", FALSE, NULL);
+
+  fs_sink_pad = gst_element_get_static_pad(fakesink, "sink");
+  gst_pad_add_probe(fs_sink_pad, GST_PAD_PROBE_TYPE_BUFFER, buffer_counter_probe, &buffer_count, NULL);
+  gst_object_unref(fs_sink_pad);
 
   sink_pad = gst_element_get_static_pad(element, "sink");
   fail_unless(sink_pad != NULL);
@@ -174,7 +198,7 @@ GST_START_TEST(test_barge_in_clear)
       "layout", G_TYPE_STRING, "interleaved",
       NULL);
 
-  gst_element_set_state(element, GST_STATE_PLAYING);
+  gst_element_set_state(pipeline, GST_STATE_PLAYING);
   g_usleep(1000000);
 
   gst_pad_send_event(sink_pad, gst_event_new_stream_start("test"));
@@ -182,24 +206,45 @@ GST_START_TEST(test_barge_in_clear)
   gst_segment_init(&segment, GST_FORMAT_TIME);
   gst_pad_send_event(sink_pad, gst_event_new_segment(&segment));
 
-  for (i = 0; i < 5; i++) {
+  for (i = 0; i < 3; i++) {
     buffer = gst_buffer_new_allocate(NULL, 640, NULL);
     GST_BUFFER_PTS(buffer) = i * GST_MSECOND * 20;
     GST_BUFFER_DURATION(buffer) = GST_MSECOND * 20;
-
     flow_ret = gst_pad_chain(sink_pad, buffer);
-    fail_unless(flow_ret == GST_FLOW_OK || flow_ret == GST_FLOW_FLUSHING,
-        "Buffer %d: chain returned unexpected %d", i, flow_ret);
-
+    fail_unless(flow_ret == GST_FLOW_OK, "Buffer %d failed", i);
     g_usleep(50000);
   }
 
+  g_usleep(200000);
+
+  for (i = 3; i < 5; i++) {
+    buffer = gst_buffer_new_allocate(NULL, 640, NULL);
+    GST_BUFFER_PTS(buffer) = i * GST_MSECOND * 20;
+    GST_BUFFER_DURATION(buffer) = GST_MSECOND * 20;
+    flow_ret = gst_pad_chain(sink_pad, buffer);
+    if (flow_ret != GST_FLOW_OK && flow_ret != GST_FLOW_FLUSHING) {
+        fail("Buffer %d failed with %s", i, gst_flow_get_name(flow_ret));
+    }
+    g_usleep(50000);
+  }
+  
   g_usleep(500000);
+  
+  gint count_snapshot = g_atomic_int_get(&buffer_count);
+  fail_unless(count_snapshot > 0, "Should have received some buffers");
+  
+  buffer = gst_buffer_new_allocate(NULL, 640, NULL);
+  GST_BUFFER_PTS(buffer) = 5 * GST_MSECOND * 20;
+  GST_BUFFER_DURATION(buffer) = GST_MSECOND * 20;
+  gst_pad_chain(sink_pad, buffer);
+  g_usleep(200000);
+  
+  fail_unless(g_atomic_int_get(&buffer_count) > count_snapshot, "Output thread should be alive and processing new buffers");
 
   gst_caps_unref(caps);
   gst_object_unref(sink_pad);
-  gst_element_set_state(element, GST_STATE_NULL);
-  gst_object_unref(element);
+  gst_element_set_state(pipeline, GST_STATE_NULL);
+  gst_object_unref(pipeline);
 }
 GST_END_TEST;
 

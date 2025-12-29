@@ -7,7 +7,7 @@ plugin_dir = meson.project_build_root() / 'src'
 # Common test environment
 test_env = environment()
 test_env.set('GST_PLUGIN_PATH', plugin_dir)
-test_env.set('GST_PLUGIN_SYSTEM_PATH', '')
+# test_env.set('GST_PLUGIN_SYSTEM_PATH', '')
 test_env.set('GST_STATE_IGNORE_ELEMENTS', '')
 test_env.set('CK_DEFAULT_TIMEOUT', '20')
 

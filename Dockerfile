@@ -34,5 +34,5 @@ COPY . .
 # Build
 RUN meson setup build && meson compile -C build
 
-# Default command: run tests
-CMD ["meson", "test", "-C", "build", "-v"]
+# Default command: run tests and static analysis
+CMD ["sh", "-c", "meson test -C build -v && meson compile -C build cppcheck"]

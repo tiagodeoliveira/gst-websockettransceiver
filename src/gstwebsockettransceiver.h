@@ -49,6 +49,7 @@ struct _GstWebSocketTransceiver
   GstClockTime base_timestamp;
   GstClockTime next_timestamp;
   gboolean first_timestamp_set;
+  gboolean need_segment;
 
   GQueue *recv_queue;
   GMutex queue_lock;

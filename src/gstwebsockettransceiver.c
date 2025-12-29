@@ -196,6 +196,7 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   self->base_timestamp = GST_CLOCK_TIME_NONE;
   self->next_timestamp = 0;
   self->first_timestamp_set = FALSE;
+  self->need_segment = FALSE;
 
   self->recv_queue = g_queue_new();
   g_mutex_init(&self->queue_lock);
@@ -485,6 +486,10 @@ gst_websocket_transceiver_flush_queue(GstWebSocketTransceiver *self)
 
   gst_pad_push_event(self->srcpad, gst_event_new_flush_start());
   gst_pad_push_event(self->srcpad, gst_event_new_flush_stop(TRUE));
+
+  g_mutex_lock(&self->output_lock);
+  self->need_segment = TRUE;
+  g_mutex_unlock(&self->output_lock);
 
   GST_DEBUG_OBJECT(self, "Queue flushed, timestamps reset");
 }
@@ -793,7 +798,15 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       }
     }
 
-    if (!segment_pushed && caps_pushed) {
+    gboolean force_segment = FALSE;
+    g_mutex_lock(&self->output_lock);
+    if (self->need_segment) {
+        force_segment = TRUE;
+        self->need_segment = FALSE;
+    }
+    g_mutex_unlock(&self->output_lock);
+
+    if ((!segment_pushed || force_segment) && caps_pushed) {
       GstSegment segment;
       gst_segment_init(&segment, GST_FORMAT_TIME);
       gst_pad_push_event(self->srcpad, gst_event_new_segment(&segment));
@@ -863,7 +876,8 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     ret = gst_pad_push(self->srcpad, buffer);
     if (ret != GST_FLOW_OK) {
       GST_WARNING_OBJECT(self, "Error pushing buffer: %s", gst_flow_get_name(ret));
-      if (ret == GST_FLOW_FLUSHING || ret == GST_FLOW_EOS) {
+      // Ignore FLUSHING if we are still running (barge-in case)
+      if ((ret == GST_FLOW_FLUSHING && !self->output_thread_running) || ret == GST_FLOW_EOS) {
         break;
       }
     }
