@@ -50,6 +50,10 @@ gst-launch-1.0 \
 | `frame-duration-ms` | uint | 250 | Frame duration in milliseconds |
 | `max-queue-size` | uint | 100 | Maximum receive queue size in buffers |
 | `initial-buffer-count` | uint | 3 | Buffers to accumulate before playback (0 = no buffering) |
+| `reconnect-enabled` | boolean | true | Enable automatic reconnection on disconnect |
+| `initial-reconnect-delay-ms` | uint | 1000 | Initial backoff delay (ms) |
+| `max-backoff-ms` | uint | 30000 | Maximum backoff delay (ms) |
+| `max-reconnects` | uint | 10 | Maximum reconnection attempts (0 = unlimited) |
 
 ## Supported Formats
 

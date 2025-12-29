@@ -15,6 +15,10 @@ enum
   PROP_FRAME_DURATION_MS,
   PROP_MAX_QUEUE_SIZE,
   PROP_INITIAL_BUFFER_COUNT,
+  PROP_RECONNECT_ENABLED,
+  PROP_INITIAL_RECONNECT_DELAY_MS,
+  PROP_MAX_BACKOFF_MS,
+  PROP_MAX_RECONNECTS,
 };
 
 #define DEFAULT_URI NULL
@@ -23,6 +27,11 @@ enum
 #define DEFAULT_FRAME_DURATION_MS 250
 #define DEFAULT_MAX_QUEUE_SIZE 100
 #define DEFAULT_INITIAL_BUFFER_COUNT 3
+
+#define DEFAULT_RECONNECT_ENABLED TRUE
+#define DEFAULT_INITIAL_RECONNECT_DELAY_MS 1000
+#define DEFAULT_MAX_BACKOFF_MS 30000
+#define DEFAULT_MAX_RECONNECTS 10
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
     GST_PAD_SINK,
@@ -117,6 +126,29 @@ gst_websocket_transceiver_class_init(GstWebSocketTransceiverClass *klass)
           0, 100, DEFAULT_INITIAL_BUFFER_COUNT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property(gobject_class, PROP_RECONNECT_ENABLED,
+      g_param_spec_boolean("reconnect-enabled", "Reconnect Enabled",
+          "Enable automatic WebSocket reconnection on disconnect/error",
+          DEFAULT_RECONNECT_ENABLED, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_INITIAL_RECONNECT_DELAY_MS,
+      g_param_spec_uint("initial-reconnect-delay-ms", "Initial Reconnect Delay",
+          "Initial reconnection delay in ms (exponential backoff starts here)",
+          100, 5000, DEFAULT_INITIAL_RECONNECT_DELAY_MS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_MAX_BACKOFF_MS,
+      g_param_spec_uint("max-backoff-ms", "Max Backoff Delay",
+          "Maximum backoff delay in ms",
+          1000, 60000, DEFAULT_MAX_BACKOFF_MS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_MAX_RECONNECTS,
+      g_param_spec_uint("max-reconnects", "Max Reconnects",
+          "Maximum reconnection attempts (0 = infinite if reconnect-enabled)",
+          0, 100, DEFAULT_MAX_RECONNECTS,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gstelement_class->change_state = gst_websocket_transceiver_change_state;
 
   gst_element_class_set_static_metadata(gstelement_class,
@@ -150,6 +182,12 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   self->frame_duration_ms = DEFAULT_FRAME_DURATION_MS;
   self->max_queue_size = DEFAULT_MAX_QUEUE_SIZE;
   self->initial_buffer_count = DEFAULT_INITIAL_BUFFER_COUNT;
+  self->reconnect_enabled = DEFAULT_RECONNECT_ENABLED;
+  self->initial_reconnect_delay_ms = DEFAULT_INITIAL_RECONNECT_DELAY_MS;
+  self->max_backoff_ms = DEFAULT_MAX_BACKOFF_MS;
+  self->max_reconnects = DEFAULT_MAX_RECONNECTS;
+  self->reconnect_count = 0;
+  self->current_backoff_ms = 0;
 
   self->bytes_per_sample = 0;
   self->frame_size_bytes = 0;
@@ -165,6 +203,7 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   g_mutex_init(&self->output_lock);
   g_cond_init(&self->output_cond);
   self->output_thread_running = FALSE;
+  self->ws_thread_running = FALSE;
 
   self->connected = FALSE;
   self->eos_sent = FALSE;
@@ -241,6 +280,18 @@ gst_websocket_transceiver_set_property(GObject *object, guint prop_id,
     case PROP_INITIAL_BUFFER_COUNT:
       self->initial_buffer_count = g_value_get_uint(value);
       break;
+    case PROP_RECONNECT_ENABLED:
+      self->reconnect_enabled = g_value_get_boolean(value);
+      break;
+    case PROP_INITIAL_RECONNECT_DELAY_MS:
+      self->initial_reconnect_delay_ms = g_value_get_uint(value);
+      break;
+    case PROP_MAX_BACKOFF_MS:
+      self->max_backoff_ms = g_value_get_uint(value);
+      break;
+    case PROP_MAX_RECONNECTS:
+      self->max_reconnects = g_value_get_uint(value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
@@ -271,6 +322,18 @@ gst_websocket_transceiver_get_property(GObject *object, guint prop_id,
       break;
     case PROP_INITIAL_BUFFER_COUNT:
       g_value_set_uint(value, self->initial_buffer_count);
+      break;
+    case PROP_RECONNECT_ENABLED:
+      g_value_set_boolean(value, self->reconnect_enabled);
+      break;
+    case PROP_INITIAL_RECONNECT_DELAY_MS:
+      g_value_set_uint(value, self->initial_reconnect_delay_ms);
+      break;
+    case PROP_MAX_BACKOFF_MS:
+      g_value_set_uint(value, self->max_backoff_ms);
+      break;
+    case PROP_MAX_RECONNECTS:
+      g_value_set_uint(value, self->max_reconnects);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -498,6 +561,8 @@ on_websocket_error(SoupWebsocketConnection *conn, GError *error, gpointer user_d
 {
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(user_data);
   GST_ERROR_OBJECT(self, "WebSocket error: %s", error ? error->message : "unknown");
+  if (self->loop)
+    g_main_loop_quit(self->loop);
 }
 
 static void
@@ -519,6 +584,8 @@ on_websocket_closed(SoupWebsocketConnection *conn, gpointer user_data)
   g_mutex_unlock(&self->state_lock);
 
   GST_INFO_OBJECT(self, "WebSocket disconnected, output thread will drain queue and send EOS");
+  if (self->loop)
+    g_main_loop_quit(self->loop);
 }
 
 static void
@@ -534,15 +601,20 @@ on_websocket_connected(GObject *source, GAsyncResult *res, gpointer user_data)
   if (error) {
     GST_ERROR_OBJECT(self, "WebSocket connection failed: %s", error->message);
     g_error_free(error);
+    if (self->loop)
+      g_main_loop_quit(self->loop);
     return;
   }
 
   if (!conn) {
     GST_ERROR_OBJECT(self, "WebSocket connection returned NULL without error");
+    if (self->loop)
+      g_main_loop_quit(self->loop);
     return;
   }
 
-  GST_INFO_OBJECT(self, "WebSocket connected to %s", self->uri);
+  GST_INFO_OBJECT(self, "WebSocket %sconnected to %s (attempt %u)", 
+      (self->reconnect_count > 0 ? "re" : ""), self->uri, self->reconnect_count);
   GST_DEBUG_OBJECT(self, "Connection state: %d",
       soup_websocket_connection_get_state(conn));
 
@@ -558,60 +630,74 @@ on_websocket_connected(GObject *source, GAsyncResult *res, gpointer user_data)
   self->connected = TRUE;
   g_cond_signal(&self->connect_cond);
   g_mutex_unlock(&self->state_lock);
+
+  gst_websocket_transceiver_flush_queue(self);
 }
 
 static gpointer
 gst_websocket_transceiver_ws_thread(gpointer user_data)
 {
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(user_data);
-  SoupMessage *msg;
 
   GST_DEBUG_OBJECT(self, "WebSocket thread started");
 
   self->context = g_main_context_new();
   g_main_context_push_thread_default(self->context);
 
-  self->session = soup_session_new();
-  self->loop = g_main_loop_new(self->context, FALSE);
+  while (self->ws_thread_running && self->reconnect_enabled && (self->max_reconnects == 0 || self->reconnect_count < self->max_reconnects)) {
+    self->session = soup_session_new();
+    self->loop = g_main_loop_new(self->context, FALSE);
 
-  GST_INFO_OBJECT(self, "Connecting to WebSocket URI: %s", self->uri);
-  msg = soup_message_new(SOUP_METHOD_GET, self->uri);
-  if (!msg) {
-    GST_ERROR_OBJECT(self, "Failed to create SoupMessage for URI: %s", self->uri);
-    return NULL;
-  }
-
-  gchar *protocols[] = {NULL};
-  soup_session_websocket_connect_async(self->session, msg, NULL, protocols, 0,
-      NULL, on_websocket_connected, self);
-
-  g_main_loop_run(self->loop);
-
-  // hold lock while clearing ws_conn to prevent race with chain function
-  g_mutex_lock(&self->state_lock);
-  if (self->ws_conn) {
-    SoupWebsocketConnection *conn = self->ws_conn;
-    self->ws_conn = NULL;
-    self->connected = FALSE;
-    g_mutex_unlock(&self->state_lock);
-
-    SoupWebsocketState state = soup_websocket_connection_get_state(conn);
-    if (state == SOUP_WEBSOCKET_STATE_OPEN) {
-      GST_DEBUG_OBJECT(self, "Closing WebSocket connection");
-      soup_websocket_connection_close(conn, SOUP_WEBSOCKET_CLOSE_NORMAL, NULL);
-    } else {
-      GST_DEBUG_OBJECT(self, "WebSocket already closed (state: %d)", state);
+    SoupMessage *msg = soup_message_new(SOUP_METHOD_GET, self->uri);
+    if (!msg) {
+      GST_ERROR_OBJECT(self, "Failed to create SoupMessage for URI: %s", self->uri);
+      g_object_unref(self->session);
+      self->session = NULL;
+      g_main_loop_unref(self->loop);
+      self->loop = NULL;
+      break;
     }
-    g_object_unref(conn);
-  } else {
-    g_mutex_unlock(&self->state_lock);
+
+    gchar *protocols[] = {NULL};
+    GST_INFO_OBJECT(self, "Connecting to WebSocket URI: %s", self->uri);
+    soup_session_websocket_connect_async(self->session, msg, NULL, protocols, 0,
+        NULL, on_websocket_connected, self);
+
+    g_main_loop_run(self->loop);
+
+    g_main_loop_unref(self->loop);
+    self->loop = NULL;
+    g_object_unref(self->session);
+    self->session = NULL;
+
+    // cleanup connection
+    g_mutex_lock(&self->state_lock);
+    if (self->ws_conn) {
+      SoupWebsocketConnection *conn = self->ws_conn;
+      self->ws_conn = NULL;
+      self->connected = FALSE;
+      g_mutex_unlock(&self->state_lock);
+      SoupWebsocketState state = soup_websocket_connection_get_state(conn);
+      if (state == SOUP_WEBSOCKET_STATE_OPEN) {
+        soup_websocket_connection_close(conn, SOUP_WEBSOCKET_CLOSE_NORMAL, NULL);
+      }
+      g_object_unref(conn);
+    } else {
+      g_mutex_unlock(&self->state_lock);
+    }
+
+    // backoff for next attempt (skip if shutting down)
+    if (!self->ws_thread_running)
+      break;
+
+    self->reconnect_count++;
+    guint backoff = self->current_backoff_ms > 0 ?
+                    MIN(self->current_backoff_ms * 2, self->max_backoff_ms) : self->initial_reconnect_delay_ms;
+    self->current_backoff_ms = backoff;
+    GST_INFO_OBJECT(self, "Reconnection attempt %u/%u failed, backoff %u ms",
+                    self->reconnect_count, self->max_reconnects, backoff);
+    g_usleep(backoff * G_TIME_SPAN_MILLISECOND);
   }
-
-  g_object_unref(self->session);
-  self->session = NULL;
-
-  g_main_loop_unref(self->loop);
-  self->loop = NULL;
 
   g_main_context_pop_thread_default(self->context);
   g_main_context_unref(self->context);
@@ -834,11 +920,14 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
 
   switch (transition) {
     case GST_STATE_CHANGE_NULL_TO_READY:
+      self->reconnect_count = 0;
+      self->current_backoff_ms = 0;
       if (!self->uri) {
         GST_ERROR_OBJECT(self, "No Websocket URI set");
         return GST_STATE_CHANGE_FAILURE;
       }
 
+      self->ws_thread_running = TRUE;
       self->ws_thread = g_thread_new("websocket-thread",
           gst_websocket_transceiver_ws_thread, self);
 
@@ -909,6 +998,7 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
       break;
 
     case GST_STATE_CHANGE_READY_TO_NULL:
+      self->ws_thread_running = FALSE;
       if (self->loop) {
         g_main_loop_quit(self->loop);
       }

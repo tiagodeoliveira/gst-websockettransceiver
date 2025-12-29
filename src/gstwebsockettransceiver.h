@@ -55,6 +55,7 @@ struct _GstWebSocketTransceiver
 
   GThread *output_thread;
   gboolean output_thread_running;
+  gboolean ws_thread_running;
   GMutex output_lock;
   GCond output_cond;
 
@@ -66,7 +67,14 @@ struct _GstWebSocketTransceiver
   GCond queue_cond;
   GCond caps_cond;
   gboolean caps_ready;
+  gboolean reconnect_enabled;
+  guint initial_reconnect_delay_ms;
+  guint max_backoff_ms;
+  guint max_reconnects;
+  guint reconnect_count;
+  guint current_backoff_ms;
 };
+
 
 struct _GstWebSocketTransceiverClass
 {
