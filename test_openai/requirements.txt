@@ -1,4 +1,0 @@
-PyGObject>=3.42.0
-pyaudio>=0.2.11
-websockets>=12.0
-rtp>=0.0.3

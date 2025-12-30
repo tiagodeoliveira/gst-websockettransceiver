@@ -158,6 +158,20 @@ docker run --rm -it gst-websockettransceiver bash
 docker run --rm gst-websockettransceiver meson test -C build --list
 ```
 
+## End-to-End Test
+
+Complete working example with real AI voice services in `test_e2e/`:
+
+```bash
+# OpenAI Realtime API
+python3 websocket_server.py --provider openai
+
+# Amazon Nova Sonic
+python3 websocket_server.py --provider nova
+```
+
+See [test_e2e/README.md](test_e2e/README.md) for setup instructions.
+
 ## Architecture
 
 The plugin is a bidirectional element with both sink and source pads:

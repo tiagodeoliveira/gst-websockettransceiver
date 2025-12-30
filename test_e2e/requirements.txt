@@ -1,0 +1,8 @@
+PyGObject>=3.42.0
+pyaudio>=0.2.11
+websockets>=12.0
+rtp>=0.0.3
+
+# For Nova Sonic provider (optional)
+aws-sdk-bedrock-runtime
+smithy-aws-core
