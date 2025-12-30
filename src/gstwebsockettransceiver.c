@@ -19,6 +19,12 @@ enum
   PROP_INITIAL_RECONNECT_DELAY_MS,
   PROP_MAX_BACKOFF_MS,
   PROP_MAX_RECONNECTS,
+  // read-only statistics
+  PROP_BYTES_SENT,
+  PROP_BYTES_RECEIVED,
+  PROP_BUFFERS_SENT,
+  PROP_BUFFERS_RECEIVED,
+  PROP_BUFFERS_DROPPED,
 };
 
 #define DEFAULT_URI NULL
@@ -150,6 +156,37 @@ gst_websocket_transceiver_class_init(GstWebSocketTransceiverClass *klass)
           0, 100, DEFAULT_MAX_RECONNECTS,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  // read-only statistics properties
+  g_object_class_install_property(gobject_class, PROP_BYTES_SENT,
+      g_param_spec_uint64("bytes-sent", "Bytes Sent",
+          "Total bytes sent to WebSocket",
+          0, G_MAXUINT64, 0,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_BYTES_RECEIVED,
+      g_param_spec_uint64("bytes-received", "Bytes Received",
+          "Total bytes received from WebSocket",
+          0, G_MAXUINT64, 0,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_BUFFERS_SENT,
+      g_param_spec_uint64("buffers-sent", "Buffers Sent",
+          "Total buffers sent to WebSocket",
+          0, G_MAXUINT64, 0,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_BUFFERS_RECEIVED,
+      g_param_spec_uint64("buffers-received", "Buffers Received",
+          "Total buffers received from WebSocket",
+          0, G_MAXUINT64, 0,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class, PROP_BUFFERS_DROPPED,
+      g_param_spec_uint64("buffers-dropped", "Buffers Dropped",
+          "Total buffers dropped (queue overflow or disconnected)",
+          0, G_MAXUINT64, 0,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
   gstelement_class->change_state = gst_websocket_transceiver_change_state;
 
   gst_element_class_set_static_metadata(gstelement_class,
@@ -222,6 +259,13 @@ gst_websocket_transceiver_init(GstWebSocketTransceiver *self)
   self->loop = NULL;
   self->ws_thread = NULL;
   self->output_thread = NULL;
+
+  // statistics counters
+  self->bytes_sent = 0;
+  self->bytes_received = 0;
+  self->buffers_sent = 0;
+  self->buffers_received = 0;
+  self->buffers_dropped = 0;
 
   // mark as live source for real-time data production
   GST_OBJECT_FLAG_SET(self, GST_ELEMENT_FLAG_SOURCE);
@@ -336,6 +380,21 @@ gst_websocket_transceiver_get_property(GObject *object, guint prop_id,
       break;
     case PROP_MAX_RECONNECTS:
       g_value_set_uint(value, self->max_reconnects);
+      break;
+    case PROP_BYTES_SENT:
+      g_value_set_uint64(value, self->bytes_sent);
+      break;
+    case PROP_BYTES_RECEIVED:
+      g_value_set_uint64(value, self->bytes_received);
+      break;
+    case PROP_BUFFERS_SENT:
+      g_value_set_uint64(value, self->buffers_sent);
+      break;
+    case PROP_BUFFERS_RECEIVED:
+      g_value_set_uint64(value, self->buffers_received);
+      break;
+    case PROP_BUFFERS_DROPPED:
+      g_value_set_uint64(value, self->buffers_dropped);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -562,10 +621,13 @@ on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
   while (g_queue_get_length(self->recv_queue) >= self->max_queue_size) {
     GstBuffer *dropped = g_queue_pop_head(self->recv_queue);
     gst_buffer_unref(dropped);
+    self->buffers_dropped++;
     GST_WARNING_OBJECT(self, "Queue full (%u), dropped old buffer", self->max_queue_size);
   }
 
   g_queue_push_tail(self->recv_queue, buffer);
+  self->bytes_received += size;
+  self->buffers_received++;
   GST_DEBUG_OBJECT(self, "Queued buffer, queue length: %u",
       g_queue_get_length(self->recv_queue));
 
@@ -577,7 +639,17 @@ static void
 on_websocket_error(SoupWebsocketConnection *conn, GError *error, gpointer user_data)
 {
   GstWebSocketTransceiver *self = GST_WEBSOCKET_TRANSCEIVER(user_data);
+  (void)conn;
+
   GST_ERROR_OBJECT(self, "WebSocket error: %s", error ? error->message : "unknown");
+
+  // post bus message so applications can react to errors
+  gst_element_post_message(GST_ELEMENT(self),
+      gst_message_new_element(GST_OBJECT(self),
+          gst_structure_new("websocket-error",
+              "error-message", G_TYPE_STRING, error ? error->message : "unknown",
+              NULL)));
+
   if (self->loop)
     g_main_loop_quit(self->loop);
 }
@@ -594,6 +666,14 @@ on_websocket_closed(SoupWebsocketConnection *conn, gpointer user_data)
 
   GST_WARNING_OBJECT(self, "WebSocket connection closed (code: %u, reason: %s)",
       close_code, close_data ? close_data : "none");
+
+  // post bus message so applications can react to disconnection
+  gst_element_post_message(GST_ELEMENT(self),
+      gst_message_new_element(GST_OBJECT(self),
+          gst_structure_new("websocket-disconnected",
+              "close-code", G_TYPE_UINT, close_code,
+              "close-reason", G_TYPE_STRING, close_data ? close_data : "",
+              NULL)));
 
   // mark as disconnected, output thread will drain queue before sending eos
   g_mutex_lock(&self->state_lock);
@@ -630,10 +710,18 @@ on_websocket_connected(GObject *source, GAsyncResult *res, gpointer user_data)
     return;
   }
 
-  GST_INFO_OBJECT(self, "WebSocket %sconnected to %s (attempt %u)", 
+  GST_INFO_OBJECT(self, "WebSocket %sconnected to %s (attempt %u)",
       (self->reconnect_count > 0 ? "re" : ""), self->uri, self->reconnect_count);
   GST_DEBUG_OBJECT(self, "Connection state: %d",
       soup_websocket_connection_get_state(conn));
+
+  // post bus message so applications can react to connection state changes
+  gst_element_post_message(GST_ELEMENT(self),
+      gst_message_new_element(GST_OBJECT(self),
+          gst_structure_new("websocket-connected",
+              "uri", G_TYPE_STRING, self->uri,
+              "reconnect-count", G_TYPE_UINT, self->reconnect_count,
+              NULL)));
 
   g_signal_connect(conn, "message",
       G_CALLBACK(on_websocket_message), self);
@@ -940,6 +1028,7 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
   if (!self->connected || !self->ws_conn) {
     g_mutex_unlock(&self->state_lock);
     GST_WARNING_OBJECT(self, "WebSocket not connected, dropping buffer");
+    self->buffers_dropped++;
     gst_buffer_unref(buffer);
     return GST_FLOW_OK;
   }
@@ -953,6 +1042,9 @@ gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffe
 
     soup_websocket_connection_send_binary(conn,
         g_bytes_get_data(bytes, NULL), g_bytes_get_size(bytes));
+
+    self->bytes_sent += map.size;
+    self->buffers_sent++;
 
     g_bytes_unref(bytes);
     gst_buffer_unmap(buffer, &map);
@@ -973,6 +1065,11 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
     case GST_STATE_CHANGE_NULL_TO_READY:
       self->reconnect_count = 0;
       self->current_backoff_ms = 0;
+      self->bytes_sent = 0;
+      self->bytes_received = 0;
+      self->buffers_sent = 0;
+      self->buffers_received = 0;
+      self->buffers_dropped = 0;
       if (!self->uri) {
         GST_ERROR_OBJECT(self, "No Websocket URI set");
         return GST_STATE_CHANGE_FAILURE;

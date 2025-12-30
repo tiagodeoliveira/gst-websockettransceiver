@@ -74,6 +74,13 @@ struct _GstWebSocketTransceiver
   guint max_reconnects;
   guint reconnect_count;
   guint current_backoff_ms;
+
+  // statistics counters (read-only, reset on NULL->READY)
+  guint64 bytes_sent;
+  guint64 bytes_received;
+  guint64 buffers_sent;
+  guint64 buffers_received;
+  guint64 buffers_dropped;
 };
 
 
