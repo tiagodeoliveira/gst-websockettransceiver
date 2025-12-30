@@ -32,6 +32,7 @@ enum
 #define DEFAULT_INITIAL_RECONNECT_DELAY_MS 1000
 #define DEFAULT_MAX_BACKOFF_MS 30000
 #define DEFAULT_MAX_RECONNECTS 10
+#define CONNECTION_TIMEOUT_SECONDS 5
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE("sink",
     GST_PAD_SINK,
@@ -467,6 +468,12 @@ gst_websocket_transceiver_sink_event(GstPad *pad, GstObject *parent, GstEvent *e
   return ret;
 }
 
+// barge-in handler: immediately clears all queued audio when the remote signals interruption
+// (e.g., user starts speaking while AI is still playing). the sequence is critical:
+// 1. clear queue to stop pending audio
+// 2. reset timestamps so new audio starts fresh
+// 3. send flush events to notify downstream elements to discard their buffers
+// 4. set need_segment flag so output thread sends a new segment before resuming
 static void
 gst_websocket_transceiver_flush_queue(GstWebSocketTransceiver *self)
 {
@@ -505,6 +512,8 @@ on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
 
   data = g_bytes_get_data(message, &size);
 
+  // text frames are control messages (JSON), not audio data. currently only "clear" is
+  // supported which triggers barge-in flush. binary frames contain raw audio bytes.
   if (type == SOUP_WEBSOCKET_DATA_TEXT) {
     GST_DEBUG_OBJECT(self, "Received text message: %.*s", (int)size, (const gchar *)data);
 
@@ -547,6 +556,9 @@ on_websocket_message(SoupWebsocketConnection *conn, gint type, GBytes *message,
 
   g_mutex_lock(&self->queue_lock);
 
+  // drop oldest buffers when queue is full. for real-time audio, fresh data is more
+  // valuable than stale data - playing outdated audio causes worse user experience
+  // than a brief gap. this also prevents memory exhaustion under sustained load.
   while (g_queue_get_length(self->recv_queue) >= self->max_queue_size) {
     GstBuffer *dropped = g_queue_pop_head(self->recv_queue);
     gst_buffer_unref(dropped);
@@ -675,7 +687,10 @@ gst_websocket_transceiver_ws_thread(gpointer user_data)
     g_object_unref(self->session);
     self->session = NULL;
 
-    // cleanup connection
+    // cleanup connection safely: we must release state_lock BEFORE calling any soup
+    // methods because soup callbacks (on_websocket_closed, etc.) also acquire state_lock.
+    // holding the lock while calling soup_websocket_connection_close would deadlock if
+    // the close triggers a callback on this same thread.
     g_mutex_lock(&self->state_lock);
     if (self->ws_conn) {
       SoupWebsocketConnection *conn = self->ws_conn;
@@ -695,6 +710,9 @@ gst_websocket_transceiver_ws_thread(gpointer user_data)
     if (!self->ws_thread_running)
       break;
 
+    // exponential backoff: first attempt uses initial_reconnect_delay_ms, subsequent
+    // attempts double the delay up to max_backoff_ms ceiling. this prevents hammering
+    // the server during outages while still recovering quickly from brief disconnects.
     self->reconnect_count++;
     guint backoff = self->current_backoff_ms > 0 ?
                     MIN(self->current_backoff_ms * 2, self->max_backoff_ms) : self->initial_reconnect_delay_ms;
@@ -759,7 +777,9 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
       }
     }
 
-    // wait for initial buffering to avoid audio clicks
+    // wait for initial buffering: accumulate N buffers before starting playback to avoid
+    // audio underruns and clicks at stream start. network jitter can cause gaps if we
+    // start playing immediately, so we build a small buffer reservoir first.
     if (initial_buffering && self->initial_buffer_count > 0) {
       g_mutex_lock(&self->queue_lock);
       guint queue_len = g_queue_get_length(self->recv_queue);
@@ -822,6 +842,10 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     }
     g_mutex_unlock(&self->state_lock);
 
+    // paced output: sleep until the pipeline clock reaches the next frame time. this
+    // ensures we push buffers at the actual playback rate rather than as fast as they
+    // arrive from the network. without pacing, downstream would receive bursts of data
+    // that could overflow buffers or cause timing issues with audio sinks.
     now = gst_clock_get_time(clock);
     if (now < next_output_time) {
       gint64 wait_ns = next_output_time - now;
@@ -842,6 +866,10 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     }
     g_mutex_unlock(&self->queue_lock);
 
+    // eos handling: only send eos after the queue is fully drained AND the websocket is
+    // disconnected. this ensures all received audio is played before signaling end of
+    // stream. if we're still connected, an empty queue just means we're waiting for more
+    // data from the network.
     if (!buffer) {
       gboolean should_send_eos = FALSE;
 
@@ -858,7 +886,10 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
         break;
       }
 
-      // still advance timestamps to maintain continuity
+      // advance timestamps even when queue is empty to maintain timing continuity. if we
+      // don't advance, the next buffer would get an old timestamp causing it to appear
+      // late or be dropped by downstream elements. the gap in audio is acceptable, but
+      // the timeline must keep moving forward.
       GST_LOG_OBJECT(self, "No data available, skipping");
       g_mutex_lock(&self->output_lock);
       self->next_timestamp += self->frame_duration;
@@ -876,7 +907,9 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
     ret = gst_pad_push(self->srcpad, buffer);
     if (ret != GST_FLOW_OK) {
       GST_WARNING_OBJECT(self, "Error pushing buffer: %s", gst_flow_get_name(ret));
-      // Ignore FLUSHING if we are still running (barge-in case)
+      // FLUSHING is expected during barge-in because flush_queue() sends flush events
+      // to downstream. we only stop if we're actually shutting down (thread not running)
+      // or if we get a true EOS from downstream.
       if ((ret == GST_FLOW_FLUSHING && !self->output_thread_running) || ret == GST_FLOW_EOS) {
         break;
       }
@@ -892,6 +925,10 @@ gst_websocket_transceiver_output_thread(gpointer user_data)
   return NULL;
 }
 
+// sink chain: receives audio from upstream and sends it over websocket. returns OK even
+// when not connected (dropping the buffer) because for real-time voice applications,
+// blocking or failing would stall the entire pipeline. stale audio is useless anyway -
+// better to drop it and keep the pipeline flowing so we can send fresh data once reconnected.
 static GstFlowReturn
 gst_websocket_transceiver_chain(GstPad *pad, GstObject *parent, GstBuffer *buffer)
 {
@@ -945,8 +982,12 @@ gst_websocket_transceiver_change_state(GstElement *element, GstStateChange trans
       self->ws_thread = g_thread_new("websocket-thread",
           gst_websocket_transceiver_ws_thread, self);
 
+      // wait for initial connection, but continue even on timeout. the state change
+      // must succeed to allow the pipeline to start - blocking indefinitely would
+      // freeze gst-launch or application startup. the ws_thread will keep trying
+      // to connect in the background with exponential backoff.
       {
-        gint64 end_time = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
+        gint64 end_time = g_get_monotonic_time() + CONNECTION_TIMEOUT_SECONDS * G_TIME_SPAN_SECOND;
         g_mutex_lock(&self->state_lock);
         while (!self->connected) {
           if (!g_cond_wait_until(&self->connect_cond, &self->state_lock, end_time)) {
