@@ -26,6 +26,7 @@ jobs:
           libsoup-3.0-dev \
           libjson-glib-dev \
           cppcheck
+        pip install websockets
 
     - name: Configure
       run: meson setup build
@@ -54,6 +55,7 @@ jobs:
     - name: Install dependencies
       run: |
         brew install meson ninja gstreamer libsoup json-glib cppcheck
+        pip3 install websockets
 
     - name: Configure
       run: meson setup build
