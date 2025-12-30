@@ -55,7 +55,7 @@ jobs:
     - name: Install dependencies
       run: |
         brew install meson ninja gstreamer libsoup json-glib cppcheck
-        pip3 install websockets
+        pip3 install --break-system-packages websockets
 
     - name: Configure
       run: meson setup build
